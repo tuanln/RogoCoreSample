@@ -56,7 +56,7 @@ Trong đó:
 - otaData: có thể truyền nil
 - timeOutL Set thời gian timeOut của hàm có thể truyền nil
 - downloadProgessing: trả ra kiểu Int, hiển thị tiến trình download
-- didUpgadeFirmwareProgessing: hiển thị tiến trinhf update firmware VD:
+- didUpgadeFirmwareProgessing: hiển thị tiến trình update firmware VD:
 ``
             didUpgadeFirmwareProgessing: {[weak self] percent in
             guard let self = self else {

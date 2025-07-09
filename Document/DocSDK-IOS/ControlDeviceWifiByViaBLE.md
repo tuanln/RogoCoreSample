@@ -91,3 +91,8 @@ Vd:
     }
 
 ```
+
+### Huỷ kết nối
+```
+        RGCore.shared.device.cancelBleConnection()
+```
