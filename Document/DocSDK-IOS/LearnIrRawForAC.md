@@ -134,3 +134,21 @@ Tiếp theo lấy ra các lệnh điều khiển:
 ```
 Bằng cách sử dụng getLearnedAcRemoteRawCmds ta lấy được thông tin về nhiệt độ, mode điều hoà và mode quạt 
 
+### Điều khiển điều hoà sau khi add xong
+
+```
+            let valueObj = RGBIRLearnedModeControlMessage(acCmdKey: irKey)
+            
+            RGCore.shared.device.sendControlDeviceMessageWith(deviceUUID: String,
+                                                              value: RGBCmdValue,
+                                                              elements: [Int],
+                                                              completion: RGBCompletionObject<Bool>?)
+
+```
+
+
+Trong đó: 
+- deviceUUID: truyền vào uuid của device
+- value: truyền vào valueObj tương ứng với key
+- elements: truyền vào element của thiết bị
+- completion: check lỗi
