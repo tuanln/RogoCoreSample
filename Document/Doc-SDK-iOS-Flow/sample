@@ -1,0 +1,584 @@
+# Rogo Smart SDK - Android
+
+## Hướng dẫn Flow thêm thiết bị mới vào tài khoản
+
+Tài liệu này mô tả quy trình chi tiết để thêm một thiết bị mới vào tài khoản người dùng thông qua Rogo Mobile SDK.
+
+## Lưu ý trước khi thực hiện
+- Đảm bảo đã cấp quyền mạng (Network) và quyền định vị (Location) cho ứng dụng
+- Đảm bảo thiết bị di động đã kết nối WiFi
+- Thiết bị cần thêm phải ở chế độ pairing/config
+
+## Sơ đồ tổng quan
+
+### Sơ đồ luồng giao tiếp
+
+```mermaid
+sequenceDiagram
+    participant App as Mobile App
+    participant SDK as Rogo SDK
+    participant Device as IoT Device
+    participant Cloud as Rogo Cloud
+
+    Note over App,Cloud: BƯỚC 1 & 2: KHỞI TẠO VÀ QUÉT THIẾT BỊ
+    App->>SDK: configHandler.startScanDevice()
+    SDK->>Device: Broadcast scan signal
+    Device-->>SDK: Device advertise (pairing mode)
+    SDK-->>App: onDeviceFound(device)
+
+    Note over App,Cloud: BƯỚC 3: KẾT NỐI THIẾT BỊ
+    App->>SDK: connectToDevice(scannedDevice)
+    SDK->>Device: Establish connection (BLE/WiFi Direct)
+    Device-->>SDK: Connection established
+    SDK-->>App: onConnected(deviceInfo)
+
+    Note over App,Cloud: BƯỚC 4: LẤY THÔNG TIN THIẾT BỊ
+    App->>SDK: getDeviceInfo()
+    SDK->>Device: Request device info
+    Device-->>SDK: MAC address, firmware, type
+    SDK-->>App: onSuccess(deviceInfo)
+
+    Note over App,Cloud: BƯỚC 5: QUÉT WIFI
+    App->>SDK: scanWifiNetworks()
+    SDK->>Device: Request WiFi scan
+    Device->>Device: Scan WiFi networks
+    Device-->>SDK: WiFi SSID 1 (rssi, security)
+    SDK-->>App: onWifiFound(ssid, rssi, security)
+    Device-->>SDK: WiFi SSID 2
+    SDK-->>App: onWifiFound(ssid, rssi, security)
+    Device-->>SDK: WiFi SSID N
+    SDK-->>App: onWifiFound(ssid, rssi, security)
+    Device-->>SDK: Scan complete
+    SDK-->>App: onWifiScanComplete(wifiList)
+
+    Note over App,Cloud: BƯỚC 6: GỬI THÔNG TIN WIFI
+    App->>SDK: setWifiCredentials(ssid, password)
+    SDK->>Device: Send WiFi credentials
+    Device-->>SDK: Credentials received
+    SDK-->>App: onWifiConfigured()
+
+    Note over App,Cloud: BƯỚC 7: THIẾT BỊ KẾT NỐI WIFI
+    Device->>Device: Connect to WiFi
+    Device-->>SDK: WiFi connection status
+    SDK-->>App: onProgress(50%, "Connecting...")
+    Device-->>SDK: WiFi connected (IP address)
+    SDK-->>App: onWifiConnected(ipAddress)
+
+    Note over App,Cloud: BƯỚC 8: ĐỒNG BỘ LÊN CLOUD
+    App->>SDK: addDeviceToCloud(setupDeviceInfo)
+    SDK->>Cloud: Register device (MAC, label, groupId)
+    Cloud->>Cloud: Create device record
+    Cloud-->>SDK: Device UUID + config
+    SDK-->>App: onProgress(75%, "Syncing...")
+    SDK->>Device: Send cloud config (UUID, token)
+    Device-->>SDK: Config applied
+    Device->>Cloud: Establish MQTT connection
+    Cloud-->>Device: Connection accepted
+    SDK-->>App: onDeviceAdded(device)
+
+    Note over App,Cloud: HOÀN TẤT
+    App->>App: Navigate to device control
+```
+
+### Sơ đồ trạng thái thiết bị
+
+```mermaid
+stateDiagram-v2
+    [*] --> Pairing: Thiết bị bật nguồn
+    Pairing --> Scanning: App bắt đầu scan
+    Scanning --> Found: Phát hiện thiết bị
+    Found --> Connecting: User chọn thiết bị
+    Connecting --> Connected: Kết nối thành công
+    Connected --> GetInfo: Lấy MAC address
+    GetInfo --> WifiScanning: Quét WiFi
+    WifiScanning --> WifiConfig: User nhập WiFi
+    WifiConfig --> WifiConnecting: Gửi credentials
+    WifiConnecting --> WifiConnected: Kết nối WiFi OK
+    WifiConnected --> CloudSync: Đồng bộ cloud
+    CloudSync --> Registered: Đăng ký thành công
+    Registered --> [*]: Thiết bị sẵn sàng
+
+    Connecting --> Error: Timeout/Failed
+    WifiConnecting --> Error: WiFi failed
+    CloudSync --> Error: Cloud failed
+    Error --> Pairing: Thử lại
+```
+
+### Sơ đồ kiến trúc giao tiếp
+
+```mermaid
+graph TB
+    subgraph "Mobile App Layer"
+        A[Activity/Fragment] --> B[ViewModel/Presenter]
+    end
+
+    subgraph "Rogo SDK Layer"
+        C[ConfigDeviceHandler]
+        D[Connection Manager]
+        E[WiFi Manager]
+        F[Cloud API Client]
+    end
+
+    subgraph "Communication Layer"
+        G[BLE/WiFi Direct]
+        H[HTTP/HTTPS]
+        I[MQTT]
+    end
+
+    subgraph "Device Layer"
+        J[IoT Device Firmware]
+        K[WiFi Module]
+    end
+
+    subgraph "Cloud Layer"
+        L[Rogo Cloud API]
+        M[Device Registry]
+        N[MQTT Broker]
+    end
+
+    B --> C
+    C --> D
+    C --> E
+    C --> F
+
+    D --> G
+    E --> G
+    F --> H
+
+    G --> J
+    J --> K
+    K --> G
+
+    H --> L
+    L --> M
+
+    J --> I
+    I --> N
+
+    style A fill:#e1f5ff
+    style C fill:#fff4e1
+    style J fill:#ffe1e1
+    style L fill:#e1ffe1
+```
+
+## Quy trình thêm thiết bị
+
+### Bước 1: Khởi tạo quá trình thêm thiết bị (Add Device)
+Khởi tạo handler để bắt đầu quá trình thêm thiết bị mới.
+
+```kotlin
+val configHandler = SmartSdk.configDeviceHandler()
+```
+
+### Bước 2: Quét thiết bị khả dụng (Scan Available Devices)
+Bắt đầu quét các thiết bị đang ở chế độ pairing trong vùng lân cận.
+
+```kotlin
+configHandler.startScanDevice(scanCallback)
+```
+
+#### Đối số
+- `scanCallback`: `ScanDeviceCallback` - Callback được gọi khi phát hiện thiết bị khả dụng
+
+#### Callback
+```kotlin
+val scanCallback = object : ScanDeviceCallback {
+    override fun onDeviceFound(device: ScannedDevice) {
+        // Thiết bị được tìm thấy
+        // device chứa thông tin: deviceId, deviceName, signal strength, etc.
+    }
+
+    override fun onScanComplete() {
+        // Quá trình quét hoàn tất
+    }
+
+    override fun onFailure(code: Int, message: String?) {
+        // Lỗi trong quá trình quét
+    }
+}
+```
+
+#### Dừng quét
+```kotlin
+configHandler.stopScanDevice()
+```
+
+### Bước 3: Kết nối đến thiết bị đích (Connect to Target Device)
+Sau khi tìm thấy thiết bị, tiến hành kết nối đến thiết bị đích.
+
+```kotlin
+configHandler.connectToDevice(scannedDevice, connectCallback)
+```
+
+#### Đối số
+- `scannedDevice`: `ScannedDevice` - Đối tượng thiết bị đã quét được từ Bước 2
+- `connectCallback`: `ConnectDeviceCallback` - Callback theo dõi trạng thái kết nối
+
+#### Callback
+```kotlin
+val connectCallback = object : ConnectDeviceCallback {
+    override fun onConnected(deviceInfo: DeviceConnectionInfo) {
+        // Kết nối thành công
+        // deviceInfo chứa thông tin kết nối
+    }
+
+    override fun onDisconnected() {
+        // Thiết bị ngắt kết nối
+    }
+
+    override fun onFailure(code: Int, message: String?) {
+        // Lỗi kết nối
+    }
+}
+```
+
+### Bước 4: Gửi tin nhắn cấu hình và lấy địa chỉ MAC (Send Config Message / Get MAC Address)
+Sau khi kết nối thành công, gửi yêu cầu lấy thông tin thiết bị (MAC address, firmware version, etc.)
+
+```kotlin
+configHandler.getDeviceInfo(deviceInfoCallback)
+```
+
+#### Callback
+```kotlin
+val deviceInfoCallback = object : RequestCallback<DeviceInfo> {
+    override fun onSuccess(deviceInfo: DeviceInfo) {
+        // Nhận được thông tin thiết bị
+        val macAddress = deviceInfo.macAddress
+        val firmwareVersion = deviceInfo.firmwareVersion
+        val deviceType = deviceInfo.deviceType
+    }
+
+    override fun onFailure(code: Int, message: String?) {
+        // Lỗi khi lấy thông tin thiết bị
+    }
+}
+```
+
+### Bước 5: Thiết bị trả về danh sách WiFi SSID (Device Returns WiFi List)
+Yêu cầu thiết bị quét và trả về danh sách các mạng WiFi khả dụng xung quanh.
+
+```kotlin
+configHandler.scanWifiNetworks(wifiScanCallback)
+```
+
+#### Callback
+```kotlin
+val wifiScanCallback = object : WifiScanCallback {
+    override fun onWifiFound(ssid: String, rssi: Int, security: Int) {
+        // Mỗi khi tìm thấy một WiFi
+        // ssid: Tên mạng WiFi
+        // rssi: Cường độ tín hiệu (dBm)
+        // security: Loại bảo mật (0: Open, 1: WEP, 2: WPA, 3: WPA2)
+    }
+
+    override fun onWifiScanComplete(wifiList: List<WifiNetwork>) {
+        // Quét WiFi hoàn tất
+        // wifiList: Danh sách đầy đủ các WiFi tìm được
+    }
+
+    override fun onFailure(code: Int, message: String?) {
+        // Lỗi trong quá trình quét WiFi
+    }
+}
+```
+
+### Bước 6: Gửi thông tin kết nối WiFi (Send WiFi Credentials)
+Gửi thông tin SSID và mật khẩu để thiết bị kết nối vào mạng WiFi.
+
+```kotlin
+configHandler.setWifiCredentials(ssid, password, wifiConfigCallback)
+```
+
+#### Đối số
+- `ssid`: `String` - Tên mạng WiFi
+- `password`: `String` - Mật khẩu WiFi
+- `wifiConfigCallback`: `WifiConfigCallback` - Callback theo dõi quá trình cấu hình WiFi
+
+#### Callback
+```kotlin
+val wifiConfigCallback = object : WifiConfigCallback {
+    override fun onProgress(progress: Int, message: String?) {
+        // Tiến độ cấu hình WiFi (0-100)
+    }
+
+    override fun onWifiConfigured() {
+        // Thiết bị đã nhận thông tin WiFi
+    }
+
+    override fun onFailure(code: Int, message: String?) {
+        // Lỗi khi cấu hình WiFi
+    }
+}
+```
+
+### Bước 7: Thiết bị kết nối WiFi và phản hồi (Device Connects to WiFi)
+Thiết bị sẽ tự động kết nối vào WiFi và gửi phản hồi về trạng thái kết nối.
+
+```kotlin
+// Callback này được tích hợp trong WifiConfigCallback
+val wifiConfigCallback = object : WifiConfigCallback {
+    override fun onProgress(progress: Int, message: String?) {
+        // Theo dõi tiến độ
+    }
+
+    override fun onWifiConnected(ipAddress: String) {
+        // Thiết bị đã kết nối WiFi thành công
+        // ipAddress: Địa chỉ IP của thiết bị trên mạng WiFi
+    }
+
+    override fun onWifiConnectionFailed(reason: String?) {
+        // Thiết bị không thể kết nối WiFi
+        // reason: Lý do thất bại (sai mật khẩu, không tìm thấy SSID, etc.)
+    }
+
+    override fun onFailure(code: Int, message: String?) {
+        // Lỗi trong quá trình kết nối
+    }
+}
+```
+
+### Bước 8: Hoàn tất cấu hình và đồng bộ lên Cloud (Complete Setup & Sync to Cloud)
+Sau khi thiết bị kết nối WiFi thành công, tiến hành đồng bộ thiết bị lên cloud và hoàn tất quá trình thêm thiết bị.
+
+```kotlin
+val setupDeviceInfo = SetupDeviceInfo().apply {
+    deviceId = macAddress
+    deviceLabel = "Tên thiết bị"
+    groupId = "id_nhóm_phòng"  // Có thể null nếu chưa gán nhóm
+    locationId = "id_vị_trí"    // ID vị trí/nhà
+}
+
+configHandler.addDeviceToCloud(setupDeviceInfo, addDeviceCallback)
+```
+
+#### Đối số
+- `setupDeviceInfo`: `SetupDeviceInfo` - Thông tin thiết bị cần thêm
+  - `deviceId`: Mã thiết bị (MAC address)
+  - `deviceLabel`: Tên/nhãn thiết bị do người dùng đặt
+  - `groupId`: ID nhóm/phòng (có thể null)
+  - `locationId`: ID vị trí/nhà
+- `addDeviceCallback`: `AddDeviceCallback` - Callback theo dõi quá trình thêm thiết bị
+
+#### Callback
+```kotlin
+val addDeviceCallback = object : AddDeviceCallback {
+    override fun onProgress(progress: Int, step: String?) {
+        // Tiến độ đồng bộ (0-100)
+        // step: Mô tả bước hiện tại
+    }
+
+    override fun onDeviceAdded(device: IoTDevice) {
+        // Thiết bị đã được thêm thành công
+        // device: Đối tượng thiết bị hoàn chỉnh với đầy đủ thông tin
+        val deviceUuid = device.uuid
+        val deviceLabel = device.label
+    }
+
+    override fun onFailure(code: Int, message: String?) {
+        // Lỗi khi thêm thiết bị lên cloud
+    }
+}
+```
+
+## Hủy bỏ quá trình thêm thiết bị
+
+Bất kỳ lúc nào trong quá trình thêm thiết bị, có thể hủy bỏ bằng cách:
+
+```kotlin
+configHandler.cancelAddDevice()
+```
+
+## Xử lý lỗi
+
+### Các mã lỗi thường gặp
+
+| Mã lỗi | Mô tả | Giải pháp |
+|--------|-------|-----------|
+| 1001 | Không tìm thấy thiết bị | Kiểm tra thiết bị đã ở chế độ pairing chưa |
+| 1002 | Timeout kết nối | Đưa thiết bị di động gần thiết bị IoT hơn |
+| 1003 | Mật khẩu WiFi sai | Kiểm tra lại mật khẩu WiFi |
+| 1004 | Không tìm thấy SSID | Kiểm tra WiFi có đang hoạt động không |
+| 1005 | Thiết bị đã được thêm | Thiết bị đã tồn tại trong tài khoản |
+| 1006 | Lỗi đồng bộ cloud | Kiểm tra kết nối internet |
+
+### Ví dụ xử lý lỗi
+
+```kotlin
+override fun onFailure(code: Int, message: String?) {
+    when (code) {
+        1001 -> {
+            // Không tìm thấy thiết bị
+            showError("Không tìm thấy thiết bị. Vui lòng kiểm tra thiết bị đã ở chế độ pairing.")
+        }
+        1003 -> {
+            // Mật khẩu WiFi sai
+            showError("Mật khẩu WiFi không đúng. Vui lòng thử lại.")
+            // Cho phép người dùng nhập lại mật khẩu
+        }
+        1006 -> {
+            // Lỗi đồng bộ cloud
+            showError("Không thể kết nối đến server. Vui lòng kiểm tra kết nối internet.")
+        }
+        else -> {
+            showError("Lỗi: $message")
+        }
+    }
+}
+```
+
+## Ví dụ Flow hoàn chỉnh
+
+```kotlin
+class AddDeviceActivity : AppCompatActivity() {
+
+    private val configHandler = SmartSdk.configDeviceHandler()
+    private var selectedDevice: ScannedDevice? = null
+    private var deviceMacAddress: String? = null
+
+    fun startAddDevice() {
+        // Bước 1 & 2: Khởi tạo và quét thiết bị
+        configHandler.startScanDevice(object : ScanDeviceCallback {
+            override fun onDeviceFound(device: ScannedDevice) {
+                // Hiển thị thiết bị tìm được
+                showDeviceInList(device)
+            }
+
+            override fun onScanComplete() {
+                showMessage("Quét thiết bị hoàn tất")
+            }
+
+            override fun onFailure(code: Int, message: String?) {
+                showError("Lỗi quét thiết bị: $message")
+            }
+        })
+    }
+
+    fun onDeviceSelected(device: ScannedDevice) {
+        selectedDevice = device
+
+        // Bước 3: Kết nối đến thiết bị
+        configHandler.connectToDevice(device, object : ConnectDeviceCallback {
+            override fun onConnected(deviceInfo: DeviceConnectionInfo) {
+                // Bước 4: Lấy thông tin thiết bị (MAC address)
+                getDeviceInfo()
+            }
+
+            override fun onDisconnected() {
+                showError("Thiết bị đã ngắt kết nối")
+            }
+
+            override fun onFailure(code: Int, message: String?) {
+                showError("Lỗi kết nối: $message")
+            }
+        })
+    }
+
+    private fun getDeviceInfo() {
+        configHandler.getDeviceInfo(object : RequestCallback<DeviceInfo> {
+            override fun onSuccess(deviceInfo: DeviceInfo) {
+                deviceMacAddress = deviceInfo.macAddress
+
+                // Bước 5: Quét WiFi
+                scanWifiNetworks()
+            }
+
+            override fun onFailure(code: Int, message: String?) {
+                showError("Lỗi lấy thông tin thiết bị: $message")
+            }
+        })
+    }
+
+    private fun scanWifiNetworks() {
+        configHandler.scanWifiNetworks(object : WifiScanCallback {
+            override fun onWifiFound(ssid: String, rssi: Int, security: Int) {
+                // Hiển thị WiFi trong danh sách
+                addWifiToList(ssid, rssi, security)
+            }
+
+            override fun onWifiScanComplete(wifiList: List<WifiNetwork>) {
+                showMessage("Tìm thấy ${wifiList.size} mạng WiFi")
+            }
+
+            override fun onFailure(code: Int, message: String?) {
+                showError("Lỗi quét WiFi: $message")
+            }
+        })
+    }
+
+    fun onWifiSelected(ssid: String, password: String) {
+        // Bước 6 & 7: Cấu hình WiFi và chờ thiết bị kết nối
+        configHandler.setWifiCredentials(ssid, password, object : WifiConfigCallback {
+            override fun onProgress(progress: Int, message: String?) {
+                updateProgress(progress, message)
+            }
+
+            override fun onWifiConfigured() {
+                showMessage("Đã gửi thông tin WiFi đến thiết bị")
+            }
+
+            override fun onWifiConnected(ipAddress: String) {
+                showMessage("Thiết bị đã kết nối WiFi: $ipAddress")
+
+                // Bước 8: Đồng bộ lên cloud
+                syncDeviceToCloud(ssid)
+            }
+
+            override fun onWifiConnectionFailed(reason: String?) {
+                showError("Thiết bị không thể kết nối WiFi: $reason")
+            }
+
+            override fun onFailure(code: Int, message: String?) {
+                showError("Lỗi cấu hình WiFi: $message")
+            }
+        })
+    }
+
+    private fun syncDeviceToCloud(deviceName: String) {
+        val setupDeviceInfo = SetupDeviceInfo().apply {
+            deviceId = deviceMacAddress
+            deviceLabel = deviceName
+            groupId = getCurrentGroupId()
+            locationId = getCurrentLocationId()
+        }
+
+        configHandler.addDeviceToCloud(setupDeviceInfo, object : AddDeviceCallback {
+            override fun onProgress(progress: Int, step: String?) {
+                updateProgress(progress, step)
+            }
+
+            override fun onDeviceAdded(device: IoTDevice) {
+                showSuccess("Thêm thiết bị thành công!")
+                // Chuyển sang màn hình điều khiển thiết bị
+                goToDeviceControl(device)
+            }
+
+            override fun onFailure(code: Int, message: String?) {
+                showError("Lỗi đồng bộ thiết bị: $message")
+            }
+        })
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // Hủy bỏ quá trình nếu activity bị destroy
+        configHandler.cancelAddDevice()
+    }
+}
+```
+
+## Lưu ý quan trọng
+
+1. **Timeout**: Mỗi bước có timeout riêng, cần xử lý trường hợp timeout
+2. **Quyền ứng dụng**: Đảm bảo đã được cấp đầy đủ quyền (Location, Network)
+3. **Trạng thái kết nối**: Luôn kiểm tra trạng thái kết nối WiFi của thiết bị di động
+4. **Xử lý lỗi**: Cần xử lý đầy đủ các trường hợp lỗi và thông báo rõ ràng cho người dùng
+5. **Memory leak**: Nhớ hủy bỏ callback và stop scan khi activity/fragment bị destroy
+6. **Thread safety**: Các callback có thể được gọi từ background thread, cần cập nhật UI trên main thread
+
+## Tài liệu tham khảo
+
+- [Cấu hình thiết bị WiFi (Wile)](WILE.md)
+- [Cấu hình thiết bị Zigbee](ZIGBEE.md)
+- [Quản lý thiết bị](../devices/DEVICES.md)
+- [Xử lý lỗi](../ERROR.md)
